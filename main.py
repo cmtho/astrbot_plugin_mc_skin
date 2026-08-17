@@ -343,11 +343,13 @@ class SkinPlugin(Star):
                     elif resp.status == 404:
                         return None
                     else:
-                        logger.error(f"UApiPro error {resp.status}: {await resp.text()}")
-                        return None
-        except Exception as e:
-            logger.error(f"UApiPro request failed for {username}: {e}")
-            return None
+                        response_text = await resp.text()
+                        raise RuntimeError(
+                            f"UApiPro HTTP {resp.status}: {response_text}"
+                        )
+        except Exception:
+            logger.exception(f"UApiPro request failed for {username}")
+            raise
 
     async def _download_skin(self, skin_url: str) -> bytes:
         async with aiohttp.ClientSession() as session:
@@ -373,7 +375,18 @@ class SkinPlugin(Star):
             yield event.plain_result("请提供 Minecraft 玩家 ID，例如：/skin Notch")
             return
 
-        player_info = await self._get_player_info(username)
+        try:
+            player_info = await self._get_player_info(username)
+        except Exception as e:
+            error_message = str(e).strip()
+            error_detail = type(e).__name__
+            if error_message:
+                error_detail = f"{error_detail}: {error_message}"
+            yield event.plain_result(
+                f"❌ 查询玩家 {username} 失败：{error_detail}"
+            )
+            return
+
         if not player_info:
             yield event.plain_result(f"❌ 未找到正版玩家 {username}，请检查 ID 是否正确。")
             return
