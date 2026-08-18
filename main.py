@@ -1,10 +1,14 @@
+import asyncio
 import aiohttp
 from pathlib import Path
+import tempfile
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
+
+from .skin_renderer import render_skin_assets
 
 PLUGIN_NAME = "astrbot_plugin_mc_skin"
 
@@ -339,11 +343,26 @@ class SkinPlugin(Star):
                     elif resp.status == 404:
                         return None
                     else:
-                        logger.error(f"UApiPro error {resp.status}: {await resp.text()}")
-                        return None
-        except Exception as e:
-            logger.error(f"UApiPro request failed for {username}: {e}")
-            return None
+                        response_text = await resp.text()
+                        raise RuntimeError(
+                            f"UApiPro HTTP {resp.status}: {response_text}"
+                        )
+        except Exception:
+            logger.exception(f"UApiPro request failed for {username}")
+            raise
+
+    async def _download_skin(self, skin_url: str) -> bytes:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                skin_url,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"下载皮肤失败，HTTP {resp.status}")
+                data = await resp.read()
+                if len(data) > 2 * 1024 * 1024:
+                    raise ValueError("皮肤文件大小超过 2 MB")
+                return data
 
     @filter.command("skin")
     async def skin(self, event: AstrMessageEvent, username: str):
@@ -356,9 +375,18 @@ class SkinPlugin(Star):
             yield event.plain_result("请提供 Minecraft 玩家 ID，例如：/skin Notch")
             return
 
-        yield event.plain_result(f"🔍 正在查询 {username} 的皮肤...")
+        try:
+            player_info = await self._get_player_info(username)
+        except Exception as e:
+            error_message = str(e).strip()
+            error_detail = type(e).__name__
+            if error_message:
+                error_detail = f"{error_detail}: {error_message}"
+            yield event.plain_result(
+                f"❌ 查询玩家 {username} 失败：{error_detail}"
+            )
+            return
 
-        player_info = await self._get_player_info(username)
         if not player_info:
             yield event.plain_result(f"❌ 未找到正版玩家 {username}，请检查 ID 是否正确。")
             return
@@ -369,60 +397,17 @@ class SkinPlugin(Star):
             yield event.plain_result(f"❌ {resolved_name} 没有设置皮肤。")
             return
 
-        cell_w = self.config.get("cell_w", 400)
-        cell_h = self.config.get("cell_h", 550)
-
-        angle_iso = self.config.get("angle_iso", 25)
-        angle_front = self.config.get("angle_front", 0)
-        angle_right = self.config.get("angle_right", 0)
-        angle_back = self.config.get("angle_back", 0)
-        angle_left = self.config.get("angle_left", 0)
-
-        show_isometric = self.config.get("render_isometric", True)
-        show_front = self.config.get("render_front", True)
-        show_right = self.config.get("render_right", True)
-        show_back = self.config.get("render_back", True)
-        show_left = self.config.get("render_left", True)
-
-        top_row = []
-        if show_front:
-            top_row.append({"angle_y": 0, "angle_x": angle_front, "label": "正面", "show_player_id": False})
-        if show_back:
-            top_row.append({"angle_y": 180, "angle_x": angle_back, "label": "背面", "show_player_id": False})
-        if show_isometric:
-            top_row.append({"angle_y": 30, "angle_x": angle_iso, "label": "3D 视角", "show_player_id": True})
-
-        bottom_row = []
-        if show_left:
-            bottom_row.append({"angle_y": 270, "angle_x": angle_left, "label": "左侧"})
-        if show_right:
-            bottom_row.append({"angle_y": 90, "angle_x": angle_right, "label": "右侧"})
-
-        show_player_name = len(top_row) == 3 and len(bottom_row) == 2
-
-        if not top_row:
-            top_row.append({"angle_y": 30, "angle_x": 25, "label": "默认", "show_player_id": True})
-
         try:
-            url = await self.html_render(
-                TEMPLATE_3D,
-                {
-                    "skin_url": skin_url,
-                    "player_name": resolved_name,
-                    "top_row": top_row,
-                    "bottom_row": bottom_row,
-                    "show_player_name": show_player_name,
-                    "cell_w": cell_w,
-                    "cell_h": cell_h,
-                },
-                options={
-                    "type": "png",
-                    "omit_background": False,
-                    "full_page": True,
-                    "timeout": 30000,
-                },
-            )
-            yield event.image_result(url)
+            skin_data = await self._download_skin(skin_url)
+            with tempfile.TemporaryDirectory(prefix="astrbot_mc_skin_") as temp_dir:
+                preview_path, gif_path = await asyncio.to_thread(
+                    render_skin_assets,
+                    skin_data,
+                    resolved_name,
+                    Path(temp_dir),
+                )
+                yield event.image_result(str(preview_path))
+                yield event.image_result(str(gif_path))
         except Exception as e:
             logger.error(f"Render error: {e}", exc_info=True)
             yield event.plain_result(f"❌ 皮肤渲染失败: {str(e)}")
